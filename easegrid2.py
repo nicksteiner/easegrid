@@ -2,18 +2,21 @@
 '''
 Author 
 ~~~~~~
-n.c.steiner, 2013
+n.c.steiner, 2013, 2018
 
-Requires: py-yaml, numpy, pyproj
+Requires: py-yaml, numpy, pyproj, affine, xarray
 
 '''
 import os
 import sys
 from collections import namedtuple
 
+import affine
 import yaml
 import numpy as np
+import xarray as xr
 from pyproj import Proj
+
 
 class _Grid(object):
     '''EASEGrid grid object template.
@@ -60,8 +63,20 @@ class _Grid(object):
 
     @property
     def geotransform(self):
-        ''' Affine transform array.'''
-        return [self.constant.s0, self.constant.size, 0, self.constant.r0, 0, self.constant.size]
+        ''' GDAL formatted geotransform.
+        :rtype: list
+        '''
+        gt0 = self.constant.s0 - self.constant.size * self.constant.cols / 2
+        gt3 = self.constant.r0 + self.constant.size * self.constant.rows / 2
+        return [gt0, self.constant.size, 0, gt3, 0, -self.constant.size]
+
+    @property
+    def transform(self):
+        return affine.Affine.from_gdal(*self.geotransform)
+
+    @property
+    def itransform(self):
+        return ~self.transform
 
     @property
     def latitude(self):
@@ -89,19 +104,56 @@ class _Grid(object):
     ~~~~~~~
     '''
 
-    FILES = {'g25': 'L', 'g12': 'H'}
+    _files = {
+        'g01_M2':   ('EASE2_M01km.lats.34704x14616x1.double', 'EASE2_M01km.lons.34704x14616x1.double'),
+        'g03_M2':   ('EASE2_M03km.lats.11568x4872x1.double',  'EASE2_M03km.lons.11568x4872x1.double'),
+        'g09_M2':   ('EASE2_M09km.lats.3856x1624x1.double',   'EASE2_M09km.lons.3856x1624x1.double'),
+        'g125_N2':  ('EASE2_N12.5km.geolocation.v0.9.nc', ),
+        'g25_N2':   ('EASE2_N25km.geolocation.v0.9.nc', ),
+        'g03125_N2':('EASE2_N3.125km.geolocation.v0.9.nc', ),
+        'g0625_N2': ('EASE2_N6.25km.geolocation.v0.9.nc', ),
+        'g125_M2':  ('EASE2_T12.5km.geolocation.v0.9.nc', ),
+        'g25_M2':   ('EASE2_T25km.geolocation.v0.9.nc', ),
+        'g03125_M2':('EASE2_T3.125km.geolocation.v0.9.nc', ),
+        'g0625_M2': ('EASE2_T6.25km.geolocation.v0.9.nc', ),
+
+        'g12_M1': ('MHLATLSB', 'MHLONLSB'),
+        'g25_M1': ('MLLATLSB', 'MLLONLSB'),
+
+        'g12_N1': ('NHLATLSB', 'NHLONLSB'),
+        'g25_N1': ('NLLATLSB', 'NLLONLSB'),
+    }
+
     def from_file(self):
         ''' Not available for all files. '''
-        assert self.name[1] == '1'
-        assert self.grid_name in self.FILES
-        lat_file, lon_file = self._coord_file()
-        lat = self._read_coord(lat_file)
-        lon = self._read_coord(lon_file)
-        return lon, lat 
 
-    def _coord_file(self):
-        coord_ = self.hemi + self.FILES[self.grid_name]
-        return coord_ + 'LATLSB', coord_ + 'LONLSB'
+        file_key = '{}_{}'.format(self.grid_name, self.name)
+
+        try:
+            lat_file, lon_file = self._files[file_key]
+        except ValueError as e:
+            raise()
+
+        if lat_file.endswith('.nc'):
+            lat, lon = self._read_dataset(lat_file)
+        elif lat_file.endswith('.double'):
+            lat = self._read_flat(lat_file)
+            lon = self._read_flat(lon_file)
+        else:
+            lat = self._read_coord(lat_file)
+            lon = self._read_coord(lon_file)
+
+        return lon, lat
+
+    def _read_dataset(self, file_name):
+        file_path = os.path.join(self._dat_path, file_name)
+        with xr.open_dataset(file_path) as ds:
+            return ds['latitude'].values, ds['latitude'].values
+
+    def _read_flat(self, file_name):
+        file_path = os.path.join(self._dat_path, file_name)
+        dat_arr = np.fromfile(open(file_path, 'rb'), dtype='double')
+        return dat_arr.reshape((self.constant.rows, self.constant.cols))
 
     def _read_coord(self, file_name):
         file_name = os.path.join(self._dat_path, file_name)
@@ -110,28 +162,29 @@ class _Grid(object):
         return coord * self.coord_scale
 
     def from_array(self):
-        one_=np.array(1)
+        """
+        Calculate lat, lon from projection.
+        :return: lon, lat
+        """
         s_, r_ = np.meshgrid(np.arange(1, self.constant.cols + 1), np.arange(1, self.constant.rows + 1))
         return self.inverse(s_, r_)
 
-    def forward(self, lon, lat):
+    def forward(self, lon, lat, rowcol=True):
         '''Lat/lon forward projected to raster/scan.
         note: one-based index         '''
-
         x_, y_ = self.p(lon, lat)
+        if not rowcol:
+            return x_, y_
         assert self.units == 'm'
-        dR, dS = x_/self.constant.size, -y_/self.constant.size
-        r_ = self.constant.r0 + dR + 1
-        s_ = self.constant.s0 + dS + 1
-        return r_, s_
+        s_, r_ = self.itransform * (x_, y_)
+        return r_ + .5, s_ + .5
 
-    def inverse(self, r_, s_):
+    def inverse(self, s_, r_):
         '''Raster/scan inverse projected to lat/lon.
         note: one-based index         '''
-
         assert self.units == 'm'
-        x_ = (r_ - self.constant.r0 - 1) * self.constant.size
-        y_ = (s_ - self.constant.s0 - 1) * -self.constant.size
+        # into meters from origin
+        x_, y_ = self.transform * (s_ - .5, r_ - .5)
         lon, lat = self.p(x_, y_, inverse=True)
         return lon, lat
 
@@ -141,11 +194,8 @@ Global Cylindrical
 '''
 
 class M1(_Grid):
-    ''' EASEGrid ver1 Global, an equal area cylindrical projection.
+    # EASEGrid ver1 Global, equal area cylindrical projection.
 
-    Keywords:
-    grid_name -- Name of grid {'l', 'h'}
-    '''
     name = 'M1'
     hemi = 'M'
     proj = 'cea'
@@ -158,23 +208,20 @@ class M1(_Grid):
     grid_names = _Grid._constant[name].keys()
 
 class M2(_Grid):
-    ''' EASEGrid ver2 Global, an equal area cylindrical projection.
+    # EASEGrid ver2 Global, equal area cylindrical projection.
 
-    Keywords:
-    grid_name -- Name of grid {'l', 'h'}
-    '''
     name = 'M2'
     hemi = 'M'
     proj = 'cea'
     lat_0 = 0
     lon_0 = 0
-    lat_1 = 30
+    lat_ts = 30
     x_0 = 0
     y_0 = 0
     ellps = 'WGS84'
     datum = 'WGS84'
     units = 'm'
-    p_args = ['proj', 'lat_0', 'lon_0', 'lat_1', 'x_0', 'y_0', 'ellps', 'datum', 'units']
+    p_args = ['proj', 'lat_0', 'lon_0', 'lat_ts', 'x_0', 'y_0', 'ellps', 'datum', 'units']
     grid_names = _Grid._constant[name].keys()
 
 '''
@@ -183,6 +230,8 @@ Polar Azimuthal
 '''
 
 class P2(_Grid):
+    # EASEGrid ver2 Polar, lambert azimuthal equal area
+
     name = 'P2'
     proj = 'laea'
     lon_0 = 0
@@ -194,15 +243,20 @@ class P2(_Grid):
     p_args = ['proj', 'lat_0', 'lon_0', 'x_0', 'y_0', 'ellps', 'datum', 'units']
     grid_names = _Grid._constant[name].keys()
 
+
 class S2(P2):
     lat_0 = -90
     hemi = 'S'
+
 
 class N2(P2):
     lat_0 = 90
     hemi = 'N'
 
+
 class P1(_Grid):
+    # EASEGrid ver1 Polar, lambert azimuthal equal area
+
     name = 'P1'
     proj = 'laea'
     lon_0 = 0
@@ -213,13 +267,12 @@ class P1(_Grid):
     p_args = ['proj', 'lat_0', 'lon_0', 'x_0', 'y_0', 'a', 'units']
     grid_names = _Grid._constant[name].keys()
 
+
 class S1(P1):
     lat_0 = -90
     hemi = 'S'
 
+
 class N1(P1):
     lat_0 = 90
     hemi = 'N'
-
-if __name__ == '__main__':
-    pass
